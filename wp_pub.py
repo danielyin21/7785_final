@@ -190,7 +190,7 @@ class CombinedNavigator(Node):
 
     def _reach_target(self):
         err = self._ang_err(self.target_yaw)
-        if abs(err) < math.radians(1.5):
+        if abs(err) < math.radians(0.5):
             self.cmd_pub.publish(Twist())
             return True
         omega = self.rotate_pd.step(err)

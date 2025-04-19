@@ -1,0 +1,3 @@
+ros2 run robot_localization ekf_localization_node \
+  --ros-args \
+    --params-file ./ekf_params.yaml
