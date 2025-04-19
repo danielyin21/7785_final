@@ -9,6 +9,13 @@ from cv_bridge import CvBridge
 import numpy as np
 import torch
 
+import warnings
+warnings.filterwarnings(
+    "ignore",
+    message=r".*torch\.cuda\.amp\.autocast.*",
+    category=FutureWarning,
+)
+
 # configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)

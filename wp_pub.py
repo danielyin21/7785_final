@@ -1,234 +1,210 @@
-# waypoint_publisher_node.py
 #!/usr/bin/env python3
-import logging
-import rclpy
+import rclpy, math, time, numpy as np
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, QoSDurabilityPolicy, QoSReliabilityPolicy, QoSHistoryPolicy
-from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped, Point, Quaternion, Twist
 from sensor_msgs.msg import LaserScan
-from std_msgs.msg import Int16, ColorRGBA
-from visualization_msgs.msg import Marker
-from cv_bridge import CvBridge
-from collections import deque
-import numpy as np
-import math
+from nav_msgs.msg import Odometry
+from std_msgs.msg import Int16
+from geometry_msgs.msg import Twist
 
-# configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# Sign IDs (must match your classifier)
+LEFT, RIGHT, DNE, STOP, GOAL = 1, 2, 3, 4, 5
+VALID_SIGNS = {LEFT, RIGHT, DNE, STOP, GOAL}
 
-# Constants
-ORIENTATION_TOLERANCE = 0.1  # radians
-WALL_DISTANCE_THRESHOLD = 0.4  # meters
-FORWARD_SPEED = 0.13  # m/s
-ROTATION_SPEED = 0.1  # rad/s
+class PD:
+    """Simple PD controller: err → angular velocity."""
+    def __init__(self, kp, kd, out_lim=1.2):
+        self.kp, self.kd, self.out_lim = kp, kd, out_lim
+        self.prev_e = 0.0
+        self.prev_t = None
 
-# QoS for AMCL
-amcl_qos = QoSProfile(
-    depth=10,
-    durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
-    reliability=QoSReliabilityPolicy.RELIABLE
-)
+    def reset(self):
+        self.prev_e = 0.0
+        self.prev_t = None
 
-# grid generation
+    def step(self, err):
+        now = time.time()
+        if self.prev_t is None:
+            self.prev_t, self.prev_e = now, err
+            return 0.0
+        dt = now - self.prev_t
+        de = err - self.prev_e
+        self.prev_t, self.prev_e = now, err
+        out = self.kp * err + self.kd * (de / dt)
+        return max(-self.out_lim, min(self.out_lim, out))
 
-def generate_grid(top_left, top_right, bottom_left, bottom_right, rows=3, cols=6):
-    grid = np.zeros((rows, cols, 2))
-    for i in range(rows):
-        left = np.linspace(top_left, bottom_left, rows)[i]
-        right = np.linspace(top_right, bottom_right, rows)[i]
-        grid[i, :, :] = np.linspace(left, right, cols)
-    return grid
-
-GRID = generate_grid(
-    top_left=(-0.5827, 2.2487),
-    top_right=(4.5474, 2.1913),
-    bottom_left=(-0.5827, -0.4162),
-    bottom_right=(4.5884, -0.4969)
-)
-
-class WaypointPublisherNode(Node):
+class CombinedNavigator(Node):
     def __init__(self):
-        super().__init__('waypoint_publisher_node')
-        self.get_logger().info('Initializing robot node')
-        logger.info('Robot node initialization')
-        self.bridge = CvBridge()
-        self.state = 'MOVING'
-        self.pred_buffer = deque(maxlen=5)
+        super().__init__('combined_navigator')
 
-        # Publishers
-        self.waypoint_pub = self.create_publisher(PoseStamped, '/goal_pose', 10)
-        self.marker_pub   = self.create_publisher(Marker, '/visualization_marker', 10)
-        self.cmd_pub      = self.create_publisher(Twist, '/cmd_vel', 10)
+        # Parameters (can be overridden via ROS2 params)
+        self.declare_parameter('forward_speed', 0.15)
+        self.declare_parameter('stop_distance', 0.50)
+        self.declare_parameter('scan_fov_deg', 60.0)
+        self.declare_parameter('kp_lin', 4.0)
+        self.declare_parameter('kd_lin', 0.5)
+        self.declare_parameter('kp_rot', 3.3)
+        self.declare_parameter('kd_rot', 0.4)
+        self.declare_parameter('shake_angle_deg', 30.0)
 
-        # Subscribers
-        self.create_subscription(PoseWithCovarianceStamped, '/amcl_pose', self.odom_callback, amcl_qos)
-        qos = QoSProfile(history=QoSHistoryPolicy.KEEP_LAST, depth=1, reliability=QoSReliabilityPolicy.BEST_EFFORT)
-        self.create_subscription(LaserScan, '/scan', self.scan_callback, qos)
-        self.create_subscription(Int16, '/class', self.classification_callback, QoSProfile(depth=10))
-        self.create_timer(0.2, self.control_loop)
+        # Drive-to-wall params
+        self.speed    = self.get_parameter('forward_speed').value
+        self.dstop    = self.get_parameter('stop_distance').value
+        self.fov_rad  = math.radians(self.get_parameter('scan_fov_deg').value)
+        kp_lin        = self.get_parameter('kp_lin').value
+        kd_lin        = self.get_parameter('kd_lin').value
+        self.drive_pd = PD(kp_lin, kd_lin)
+
+        # Rotation params
+        kp_rot        = self.get_parameter('kp_rot').value
+        kd_rot        = self.get_parameter('kd_rot').value
+        self.rotate_pd = PD(kp_rot, kd_rot)
+        self.shake_deg = self.get_parameter('shake_angle_deg').value
 
         # State
-        self.current_pose = None
         self.yaw = 0.0
-        self.front_lidar = None
-        self.curr_class = None
-        self.initialized = False
-        self.grid_x = 0
-        self.grid_y = 0
-        self.current_orient = 0
-        self.orientations = {0: math.pi/2, 1: 0, 2: -math.pi/2, 3: math.pi}
+        self.yaw_ref_drive = None
+        self.arrived = False
 
-    def odom_callback(self, msg):
-        pos = msg.pose.pose.position
-        ori = msg.pose.pose.orientation
-        self.current_pose = pos
-        self.yaw = 2 * math.atan2(ori.z, ori.w)
-        if not self.initialized:
-            flat = GRID.reshape(-1, 2)
-            dists = [math.hypot(pos.x-p[0], pos.y-p[1]) for p in flat]
-            idx = int(np.argmin(dists))
-            self.grid_y, self.grid_x = divmod(idx, GRID.shape[1])
-            self.current_orient = max(self.orientations.items(), key=lambda x: math.cos(self.yaw - x[1]))[0]
-            self.initialized = True
-            self.publish_points()
-            self.get_logger().info(f"Init done: grid=({self.grid_x},{self.grid_y}) orient={self.current_orient}")
-            logger.info(f"Init at cell ({self.grid_x},{self.grid_y}), orient {self.current_orient}")
+        self.rotation_state = 'WAIT_WALL'
+        self.yaw_orig = None
+        self.target_yaw = None
+        self.sign = None
 
-    def scan_callback(self, msg):
-        arr = np.array(msg.ranges)
-        arr = arr[~np.isnan(arr)]
-        self.front_lidar = float((arr[:10].mean() + arr[-10:].mean()) / 2)
+        # Publishers & Subscribers
+        self.cmd_pub = self.create_publisher(Twist, '/cmd_vel', 10)
+        self.create_subscription(LaserScan,  '/scan', self.scan_cb, 10)
+        self.create_subscription(Odometry,   '/odom', self.odom_cb, 10)
+        self.create_subscription(Int16,      '/class', self.class_cb, 10)
 
-    def classification_callback(self, msg):
-        self.curr_class = msg.data
-        self.get_logger().info(f"Received class: {self.curr_class}")
-        logger.info(f"Class msg: {self.curr_class}")
+        # Main loop
+        self.create_timer(0.05, self.tick)
 
-    def publish_points(self):
-        marker = Marker()
-        marker.header.frame_id = 'map'
-        marker.header.stamp = self.get_clock().now().to_msg()
-        marker.type = Marker.POINTS
-        marker.scale.x = marker.scale.y = 0.1
-        marker.color = ColorRGBA(r=0.0, g=1.0, b=0.0, a=1.0)
-        for row in GRID:
-            for x,y in row:
-                marker.points.append(Point(x=x,y=y,z=0.0))
-        current = Marker()
-        current.header.frame_id = 'map'
-        current.header.stamp = self.get_clock().now().to_msg()
-        current.type = Marker.SPHERE
-        current.scale.x = current.scale.y = current.scale.z = 0.2
-        current.color = ColorRGBA(r=1.0, g=0.0, b=0.0, a=1.0)
-        current.pose.position = Point(x=GRID[self.grid_y,self.grid_x,0], y=GRID[self.grid_y,self.grid_x,1], z=0.0)
-        self.marker_pub.publish(marker)
-        self.marker_pub.publish(current)
-        self.get_logger().info("Published grid and current position markers")
-        logger.info("Markers published to /visualization_marker")
+        self.get_logger().info('CombinedNavigator started')
 
-    def compute_next(self, cls):
-        o = self.current_orient
-        if cls == 1:
-            logger.info("Turn Left")
-            o = (o-1) % 4
-        elif cls == 2:
-            logger.info("Turn Right")
-            o = (o+1) % 4
-        elif cls in (3,4):
-            logger.info("Reverse/Stop")
-            o = (o+2) % 4
-        elif cls == 5:
-            logger.info("Goal detected")
-            return self.grid_x, self.grid_y, o
+    def odom_cb(self, msg: Odometry):
+        q = msg.pose.pose.orientation
+        siny = 2.0*(q.w*q.z + q.x*q.y)
+        cosy = 1.0 - 2.0*(q.y*q.y + q.z*q.z)
+        self.yaw = math.atan2(siny, cosy)
+
+    def scan_cb(self, scan: LaserScan):
+        # compute min distance in front FOV
+        half = self.fov_rad/2.0
+        start = int((-half - scan.angle_min)/scan.angle_increment)
+        end   = int(( half - scan.angle_min)/scan.angle_increment)
+        start = max(0, start); end = min(len(scan.ranges)-1, end)
+        seg = np.array(scan.ranges[start:end+1])
+        dist = float(np.nanmin(seg)) if seg.size else float('inf')
+
+        if not self.arrived and dist < self.dstop:
+            self.arrived = True
+            self.yaw_orig = self.yaw
+            self.rotation_state = 'DECIDE'
+            self.rotate_pd.reset()
+            self.get_logger().info('Arrived at wall, switching to rotation')
+
+    def class_cb(self, msg: Int16):
+        sid = int(msg.data)
+        if sid in VALID_SIGNS:
+            self.sign = sid
+            # if shaking, interrupt back-to-original to rotate sign
+            if self.rotation_state in ('SHAKE_LEFT', 'SHAKE_RIGHT'):
+                self.rotation_state = 'SHAKE_BACK'
+                self.rotate_pd.reset()
+
+    def tick(self):
+        if not self.arrived:
+            self._drive_to_wall()
         else:
-            logger.info("No sign; go straight")
-        dx,dy = 0,0
-        if o==0: dy=-1
-        elif o==1: dx=1
-        elif o==2: dy=1
-        elif o==3: dx=-1
-        nx = max(0, min(self.grid_x+dx, GRID.shape[1]-1))
-        ny = max(0, min(self.grid_y+dy, GRID.shape[0]-1))
-        logger.info(f"Next cell: ({nx},{ny}), orient {o}")
-        return nx,ny,o
+            self._rotate_to_sign()
 
-    def publish_waypoint(self, gx, gy, orient_idx):
-        wp = GRID[gy,gx]
-        msg = PoseStamped()
-        msg.header.frame_id = 'map'
-        msg.header.stamp = self.get_clock().now().to_msg()
-        msg.pose.position = Point(x=wp[0], y=wp[1], z=0.0)
-        msg.pose.orientation = Quaternion(x=0.0,y=0.0,z=math.sin(self.orientations[orient_idx]/2), w=math.cos(self.orientations[orient_idx]/2))
-        self.waypoint_pub.publish(msg)
-        self.get_logger().info(f"Waypoint → ({wp[0]:.3f},{wp[1]:.3f}) orient={orient_idx}")
-        logger.info(f"Published goal_pose ({wp[0]:.3f},{wp[1]:.3f}) orient idx {orient_idx}")
+    def _drive_to_wall(self):
+        tw = Twist()
+        # initialize reference yaw once
+        if self.yaw_ref_drive is None:
+            self.yaw_ref_drive = self.yaw
+            self.drive_pd.reset()
+        err = (self.yaw_ref_drive - self.yaw + math.pi) % (2*math.pi) - math.pi
+        tw.angular.z = self.drive_pd.step(err)
+        tw.linear.x  = self.speed
+        self.cmd_pub.publish(tw)
 
-    def control_loop(self):
-        target_yaw = self.orientations[self.current_orient]
-        yaw_error = math.atan2(math.sin(target_yaw - self.yaw), math.cos(target_yaw - self.yaw))
-        if abs(yaw_error)>ORIENTATION_TOLERANCE and self.state=='MOVING':
-            cmd = Twist()
-            cmd.angular.z = ROTATION_SPEED*(1 if yaw_error>0 else -1)
-            self.cmd_pub.publish(cmd)
-            self.get_logger().info(f"Aligning: yaw_err={yaw_error:.3f}, cmd.angular.z={cmd.angular.z:.3f}")
-            logger.info("Rotating to align with wall")
-            return
-        
-        if not (self.initialized and self.front_lidar is not None and self.curr_class is not None):
-            return
-        
-        if self.state=='MOVING':
-            if self.front_lidar>WALL_DISTANCE_THRESHOLD:
-                cmd=Twist(); cmd.linear.x=FORWARD_SPEED
-                self.cmd_pub.publish(cmd)
-                self.get_logger().info(f"Moving forward: lidar={self.front_lidar:.3f}")
-                logger.info("Forward cmd published")
-                return
+    def _rotate_to_sign(self):
+        st = self.rotation_state
+        if st == 'DECIDE':
+            if self.sign is not None:
+                self._prep_sign_rotation()
             else:
-                self.state='CLASSIFY'; self.pred_buffer.clear()
-                self.get_logger().info("Switched to CLASSIFY")
-                logger.info("Entering classification state")
-                return
-        
-        if self.state=='CLASSIFY':
-            cls = self.curr_class
-            self.pred_buffer.append(cls)
-            if len(self.pred_buffer)==self.pred_buffer.maxlen:
-                unique = set(self.pred_buffer)
-                if len(unique)==1 and 0 in unique:
-                    cmd=Twist(); cmd.angular.z=ROTATION_SPEED * 10
-                    self.cmd_pub.publish(cmd)
-                    self.get_logger().info("Empty wall; rotating")
-                    logger.info("Empty classification; rotating to scan")
-                    self.pred_buffer.clear()
-                    return
-                elif len(unique)==1:
-                    cls = unique.pop()
-                    self.get_logger().info(f"Classified sign: {cls}")
-                    logger.info(f"Final class decision: {cls}")
-                    nx,ny,new_o = self.compute_next(cls)
-                    if cls==5:
-                        logger.info("Goal: shutting down node")
-                        rclpy.shutdown()
-                        return
-                    self.grid_x,self.grid_y,self.current_orient = nx,ny,new_o
-                    self.publish_waypoint(nx,ny,new_o)
-                    self.curr_class = None
-                    self.state = 'MOVING'
-                    self.get_logger().info("State = MOVING")
-                    logger.info("Committed waypoint and resumed MOVING state")
-                    return
-            return
+                self.target_yaw = (self.yaw_orig + math.radians(self.shake_deg))%(2*math.pi)
+                self.rotation_state = 'SHAKE_LEFT'
+                self.rotate_pd.reset()
 
+        elif st == 'SHAKE_LEFT':
+            if self._reach_target():
+                self.target_yaw = (self.yaw_orig - math.radians(self.shake_deg))%(2*math.pi)
+                self.rotation_state = 'SHAKE_RIGHT'
+                self.rotate_pd.reset()
+
+        elif st == 'SHAKE_RIGHT':
+            if self._reach_target():
+                self.target_yaw = self.yaw_orig
+                self.rotation_state = 'SHAKE_BACK'
+                self.rotate_pd.reset()
+
+        elif st == 'SHAKE_BACK':
+            if self._reach_target():
+                if self.sign is not None:
+                    self._prep_sign_rotation()
+                else:
+                    self.rotation_state = 'WAIT_WALL'
+                    self.get_logger().info('No sign detected, ready for next wall')
+
+        elif st == 'SIGN_ROTATE':
+            if self._reach_target():
+                self.rotation_state = 'WAIT_WALL'
+                self.get_logger().info('Sign rotation complete')
+
+        # WAIT_WALL: do nothing
+
+    def _prep_sign_rotation(self):
+        self.yaw_orig = self.yaw
+        if   self.sign == LEFT:  offset =  math.pi/2
+        elif self.sign == RIGHT: offset = -math.pi/2
+        elif self.sign in (DNE, STOP): offset = math.pi
+        elif self.sign == GOAL:
+            self.get_logger().info('GOAL reached! stopping.')
+            self.cmd_pub.publish(Twist())
+            self.rotation_state = 'WAIT_WALL'
+            return
+        else:
+            offset = 0.0
+        self.target_yaw = (self.yaw_orig + offset)%(2*math.pi)
+        self.rotation_state = 'SIGN_ROTATE'
+        self.rotate_pd.reset()
+
+    def _ang_err(self, tgt):
+        return (tgt - self.yaw + math.pi)%(2*math.pi) - math.pi
+
+    def _reach_target(self):
+        err = self._ang_err(self.target_yaw)
+        if abs(err) < math.radians(1.5):
+            self.cmd_pub.publish(Twist())
+            return True
+        omega = self.rotate_pd.step(err)
+        # enforce minimum turn
+        if 0 < abs(omega) < 0.15:
+            omega = 0.15 * math.copysign(1, omega)
+        tw = Twist(); tw.angular.z = omega
+        self.cmd_pub.publish(tw)
+        return False
 
 def main(args=None):
     rclpy.init(args=args)
-    node = WaypointPublisherNode()
+    node = CombinedNavigator()
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
-        logger.info('Shutting down robot node')
+        pass
     finally:
         node.destroy_node()
         rclpy.shutdown()

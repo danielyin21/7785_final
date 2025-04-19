@@ -1,76 +1,63 @@
 #!/usr/bin/env python3
-"""
-SignClassifier Node using YOLOv5s for Gazebo camera input
-"""
-import rclpy
+import rclpy, torch, cv2
 from rclpy.node import Node
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import CompressedImage
 from std_msgs.msg import Int32
 from cv_bridge import CvBridge
-import torch
-import numpy as np
-
-import warnings
-warnings.filterwarnings(
-    "ignore",
-    message=r".*torch\.cuda\.amp\.autocast.*",
-    category=FutureWarning,
-)
-
-class YoloDetector:
-    """Wrapper for custom YOLOv5 small model."""
-    def __init__(self, model_path: str, device: str = 'cpu'):
-        self.model = torch.hub.load(
-            'ultralytics/yolov5', 'custom', path=model_path, force_reload=False
-        ).to(device)
-        self.model.eval()
-        self.model.conf = 0.2  # confidence threshold
-        self.model.iou = 0.45  # NMS IoU threshold
-
-    def predict(self, image: np.ndarray) -> int:
-        # BGR image → RGB
-        rgb = image[..., ::-1]
-        results = self.model(rgb)
-        preds = results.xyxy[0]  # (N,6): x1,y1,x2,y2,conf,cls
-        if preds.shape[0] == 0:
-            return 0
-        # pick highest-confidence detection
-        confs = preds[:, 4]
-        best = int(confs.argmax())
-        return int(preds[best, 5])
+from rclpy.qos import qos_profile_sensor_data
+from torchvision import transforms
+from PIL import Image
 
 class SignClassifier(Node):
-    """ROS2 node: subscribes to raw Image, predicts sign ID, publishes Int32"""
     def __init__(self):
         super().__init__('sign_classifier')
-        self.get_logger().info('SignClassifier: starting')
-        self.bridge = CvBridge()
-        # load YOLO model
-        dev = 'cuda' if torch.cuda.is_available() else 'cpu'
-        self.detector = YoloDetector('yolov5s_best.pt', dev)
+        self.get_logger().info('Sign Classifier Node Started')
 
-        # subscriber to Gazebo camera
-        self.create_subscription(
-            Image,
-            '/simulated_camera/image_raw',
-            self.image_cb,
-            10
+        self.br = CvBridge()
+
+        self.model = torch.load('2025G_model2.pkl', map_location=torch.device('cpu'), weights_only=False)
+        self.model.eval()
+
+        self.transform = transforms.Compose([
+            transforms.Resize((256, 256)),
+            transforms.CenterCrop(224),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                 std=[0.229, 0.224, 0.225])
+        ])
+
+        self.sub = self.create_subscription(
+            CompressedImage,
+            '/image_raw/compressed',
+            self.cb,
+            qos_profile_sensor_data
         )
-        # publisher for sign ID
+
         self.pub = self.create_publisher(Int32, '/sign_id', 10)
 
-    def image_cb(self, msg: Image):
+    def cb(self, msg):
         try:
-            # convert ROS Image to OpenCV BGR
-            img = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+            img = self.br.compressed_imgmsg_to_cv2(msg, 'bgr8')
+
+            cv2.imshow("TurtleBot3 Camera", img)
+            cv2.waitKey(1)
+
+            input_tensor = self.preprocess(img)
+
+            with torch.no_grad():
+                pred = self.model(input_tensor).argmax().item()
+
+            self.pub.publish(Int32(data=pred))
+            self.get_logger().info(f"Predicted Sign ID: {pred}")
+
         except Exception as e:
-            self.get_logger().error(f'CVBridge error: {e}')
-            return
-        # predict class
-        cls = self.detector.predict(img)
-        # publish sign ID
-        self.pub.publish(Int32(data=cls))
-        self.get_logger().info(f'Predicted sign_id={cls}')
+            self.get_logger().error(f"Prediction failed: {str(e)}")
+
+    def preprocess(self, img):
+        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        pil_img = Image.fromarray(img_rgb)
+        input_tensor = self.transform(pil_img).unsqueeze(0)
+        return input_tensor.to(torch.float)
 
 def main():
     rclpy.init()
@@ -82,6 +69,7 @@ def main():
     finally:
         node.destroy_node()
         rclpy.shutdown()
+        cv2.destroyAllWindows()
 
 if __name__ == '__main__':
     main()
