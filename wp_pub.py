@@ -73,7 +73,8 @@ class CombinedNavigator(Node):
         # Publishers & Subscribers
         self.cmd_pub = self.create_publisher(Twist, '/cmd_vel', 10)
         self.create_subscription(LaserScan,  '/scan', self.scan_cb, 10)
-        self.create_subscription(Odometry,   '/odom', self.odom_cb, 10)
+        # self.create_subscription(Odometry,   '/odom', self.odom_cb, 10)
+        self.create_subscription(Odometry, '/odometry/filtered', self.odom_cb, 10)
         self.create_subscription(Int16,      '/class', self.class_cb, 10)
 
         # Main loop
