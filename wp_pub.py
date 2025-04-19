@@ -162,6 +162,9 @@ class CombinedNavigator(Node):
         elif st == 'SIGN_ROTATE':
             if self._reach_target():
                 self.rotation_state = 'WAIT_WALL'
+                self.arrived        = False       # allow driving again
+                self.yaw_ref_drive  = None        # reset forward‐drive reference
+                self.sign           = None        # clear previous sign
                 self.get_logger().info('Sign rotation complete')
 
         # WAIT_WALL: do nothing
