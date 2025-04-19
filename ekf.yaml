@@ -1,19 +1,25 @@
-ekf_filter_node:
+ekf_node:
   ros__parameters:
-    frequency: 50.0
+    # General filter settings
+    frequency:      50.0
     sensor_timeout: 0.1
-    two_d_mode: true          # we only care about X, Y, yaw
-    publish_tf: false         # Nav2 TF remains
-    odom0: /odom
-    odom0_config: [true, true, false, false, false, true,
-                   false, false, false, false, false, false,
-                   false, false, false]
-    imu0: /imu/data
-    imu0_config: [false, false, false, true, true, true,
-                  false, false, false, true, true, true,
-                  false, false, false]
-    imu0_queue_size: 50
-    map_frame: odom
-    odom_frame: base_link
-    base_link_frame: base_link
-    world_frame: odom
+    two_d_mode:     true
+    publish_tf:     false
+
+    # Input sources
+    odom0:           /odom
+    odom0_config:   [true, true, false,  false, false,  true,
+                     false, false, false, false, false, false,
+                     false, false, false]
+    imu0:            /imu/data
+    imu0_config:   [false, false, false,  true,  true,  true,
+                    false, false, false,  true,  true,  true,
+                    false, false, false]
+
+    # Frame names—must all be unique
+    map_frame:        map
+    odom_frame:       odom
+    base_link_frame:  base_link
+
+    # World frame must match either map_frame or odom_frame
+    world_frame:      odom
